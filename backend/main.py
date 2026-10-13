@@ -696,4 +696,3 @@ async def ai_test():
         )
 
     return {"answer": response["message"]["content"]}
-d 
