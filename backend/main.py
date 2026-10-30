@@ -79,7 +79,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
-        "http://127.0.0.1:5173",
+        "https://knowvault-3fzb685yl-tulsyangunika-3617.vercel.app",
+        "https://knowvault-one.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
