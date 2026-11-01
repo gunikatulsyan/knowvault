@@ -3,6 +3,7 @@ uvicorn[standard]
 motor
 redis
 ollama
+openai
 python-dotenv
 pydantic
 certifi

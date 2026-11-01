@@ -7,6 +7,7 @@ import time
 from contextlib import asynccontextmanager
 
 import ollama
+from openai import OpenAI
 import redis.asyncio as redis
 from bson import ObjectId
 from dotenv import load_dotenv
@@ -24,8 +25,39 @@ load_dotenv()
 
 MONGO_URL = os.getenv("MONGO_URL")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "knowvault")
+# Select "ollama" for local development or "groq" for hosted production inference.
+AI_PROVIDER = os.getenv("AI_PROVIDER", "ollama").strip().lower()
+
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+
+ollama_client = None
+groq_client = None
+
+if AI_PROVIDER == "ollama":
+    ollama_client = ollama.Client(
+        host=OLLAMA_HOST,
+        headers=(
+            {"Authorization": f"Bearer {OLLAMA_API_KEY}"}
+            if OLLAMA_API_KEY else {}
+        ),
+    )
+elif AI_PROVIDER == "groq":
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is required when AI_PROVIDER=groq")
+    groq_client = OpenAI(
+        api_key=GROQ_API_KEY,
+        base_url=GROQ_BASE_URL,
+        timeout=120.0,
+    )
+else:
+    raise RuntimeError("AI_PROVIDER must be either 'ollama' or 'groq'")
 
 if not MONGO_URL:
     raise RuntimeError("MONGO_URL is missing from backend/.env")
@@ -65,7 +97,7 @@ app = FastAPI(
     title="KnowVault API",
     description=(
         "Personal Knowledge Management using MongoDB, "
-        "Redis, and local Ollama AI."
+        "Redis, and configurable AI inference."
     ),
     lifespan=lifespan,
 )
@@ -75,13 +107,20 @@ app = FastAPI(
 # CORS
 # =========================================================
 
+# Set CORS_ORIGINS on Render to your deployed frontend origin(s), comma-separated.
+# Example: https://your-knowvault.vercel.app
+cors_origins = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "https://knowvault-3fzb685yl-tulsyangunika-3617.vercel.app",
-        "https://knowvault-one.vercel.app",
-    ],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -389,12 +428,20 @@ async def generate_answer(
 
     messages.append({"role": "user", "content": question})
 
+    if AI_PROVIDER == "groq":
+        response = await asyncio.to_thread(
+            groq_client.chat.completions.create,
+            model=GROQ_MODEL,
+            messages=messages,
+            temperature=0.7,
+        )
+        return response.choices[0].message.content or ""
+
     response = await asyncio.to_thread(
-        ollama.chat,
+        ollama_client.chat,
         model=OLLAMA_MODEL,
         messages=messages,
     )
-
     return response["message"]["content"]
 
 
@@ -407,7 +454,8 @@ async def root():
     return {
         "message": "KnowVault API is running",
         "databases": ["MongoDB", "Redis"],
-        "ai_model": OLLAMA_MODEL,
+        "ai_provider": AI_PROVIDER,
+        "ai_model": GROQ_MODEL if AI_PROVIDER == "groq" else OLLAMA_MODEL,
     }
 
 
@@ -618,8 +666,8 @@ async def ask_question(payload: Question):
 
     await record_analytics("cache_miss", session_id)
 
-    # 6. Generate an answer with Ollama. Even when no note matches,
-    # history can provide context and the assistant can answer generally.
+    # 6. Generate an answer with the configured AI provider.
+    # Even when no note matches, history can provide context.
     try:
         answer = await generate_answer(
             question,
@@ -627,13 +675,12 @@ async def ask_question(payload: Question):
             history,
         )
     except Exception as error:
-        print(f"Ollama generation error: {error}")
+        print(f"AI generation error ({AI_PROVIDER}): {error}")
         raise HTTPException(
             status_code=503,
             detail=(
-                "The local AI could not generate an answer. "
-                "Check that Ollama is running and the configured model "
-                "is available."
+                "The AI provider could not generate an answer. "
+                "Check the configured provider, API key, model, and backend logs."
             ),
         )
 
@@ -648,9 +695,9 @@ async def ask_question(payload: Question):
     return {
         "answer": answer,
         "source": (
-            "ollama + mongodb"
+            f"{AI_PROVIDER} + mongodb"
             if matching_notes
-            else "ollama + conversation history"
+            else f"{AI_PROVIDER} + conversation history"
         ),
         "session_id": session_id,
         "agent_steps": [
@@ -665,7 +712,7 @@ async def ask_question(payload: Question):
                 if is_followup
                 else "Processed the current question"
             ),
-            "Generated an answer using local Ollama AI",
+            f"Generated an answer using {AI_PROVIDER}",
             "Cached the answer in Redis for one hour",
             "Saved this turn to Redis conversation history",
         ],
@@ -678,22 +725,42 @@ async def ask_question(payload: Question):
 
 @app.get("/ai-test")
 async def ai_test():
+    """Test the configured AI provider (Ollama locally or Groq in production)."""
+    messages = [
+        {
+            "role": "user",
+            "content": "Reply with: KnowVault AI is working.",
+        }
+    ]
+
     try:
-        response = await asyncio.to_thread(
-            ollama.chat,
-            model=OLLAMA_MODEL,
-            messages=[
-                {
-                    "role": "user",
-                    "content": "Reply with: KnowVault local AI is working.",
-                }
-            ],
-        )
+        if AI_PROVIDER == "groq":
+            response = await asyncio.to_thread(
+                groq_client.chat.completions.create,
+                model=GROQ_MODEL,
+                messages=messages,
+            )
+            answer = response.choices[0].message.content or ""
+            model = GROQ_MODEL
+        else:
+            response = await asyncio.to_thread(
+                ollama_client.chat,
+                model=OLLAMA_MODEL,
+                messages=messages,
+            )
+            answer = response["message"]["content"]
+            model = OLLAMA_MODEL
+
+        return {
+            "status": "success",
+            "provider": AI_PROVIDER,
+            "model": model,
+            "answer": answer,
+        }
+
     except Exception as error:
-        print(f"Ollama test error: {error}")
+        print(f"AI test error ({AI_PROVIDER}): {error}")
         raise HTTPException(
             status_code=503,
-            detail="Ollama is unavailable or the model is not installed.",
+            detail="AI provider is unavailable. Check backend logs and provider configuration.",
         )
-
-    return {"answer": response["message"]["content"]}
